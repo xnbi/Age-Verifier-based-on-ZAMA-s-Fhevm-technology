@@ -11,7 +11,7 @@
 
 **A privacy-preserving age verification system with NFT credentials, powered by Fully Homomorphic Encryption**
 
-[Live Demo](https://gregarious-faun-68701e.netlify.app/#) | [Documentation](DEPLOYMENT.md) | [Quick Start](#-quick-start)
+[Live Demo](https://harmonious-cuchufli-91fdd3.netlify.app/) | [Documentation](DEPLOYMENT.md) | [Quick Start](#-quick-start)
 
 </div>
 
