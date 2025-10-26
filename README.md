@@ -1,5 +1,5 @@
 # 🔐 FHEVM Age Verifier with NFT Credentials
-<img width="2560" height="1278" alt="image" src="https://github.com/user-attachments/assets/314bae8e-0695-4f36-a460-c6da67b201d9" />
+<img width="2560" height="1279" alt="image" src="https://github.com/user-attachments/assets/9c625708-1d54-4c1d-b1fc-ca5c417d080a" />
 
 
 <div align="center">
