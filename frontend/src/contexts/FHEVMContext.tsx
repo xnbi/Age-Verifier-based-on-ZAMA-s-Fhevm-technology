@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, type ReactNode } from 'react';
-import { createInstance } from '@fhevm/sdk';
+import { createEncryptedInput } from '@zama-fhe/relayer-sdk';
 
 // Gateway 配置
 const GATEWAY_URL = 'https://gateway.sepolia.zama.ai';
@@ -10,7 +10,7 @@ interface FHEVMContextType {
   fhevmInstance: any;
   gatewayStatus: 'up' | 'down' | 'checking';
   fheStatus: 'up' | 'down' | 'checking'; // Alias for gatewayStatus
-  initializeFHEVM: (contractAddress: string, userAddress: string) => Promise<void>;
+  initializeFHEVM: () => Promise<void>;
   isInitialized: boolean;
   encryptAge: (age: number, contractAddress: string, userAddress: string) => Promise<{ encrypted: any; proof: string } | null>;
 }
@@ -20,7 +20,9 @@ const FHEVMContext = createContext<FHEVMContextType | null>(null);
 
 // Provider 组件
 export function FHEVMProvider({ children }: { children: ReactNode }) {
-  const [fhevmInstance, setFhevmInstance] = useState<any>(null);
+  // 注意：使用 @zama-fhe/relayer-sdk 后不再需要实例
+  // 保留 fhevmInstance 仅为了向后兼容
+  const [fhevmInstance] = useState<any>(null);
   const [gatewayStatus, setGatewayStatus] = useState<'up' | 'down' | 'checking'>('checking');
   const [isInitialized, setIsInitialized] = useState(false);
 
@@ -54,99 +56,70 @@ export function FHEVMProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  // 初始化 FHEVM 实例
-  const initializeFHEVM = async (contractAddress: string, userAddress: string) => {
+  // 初始化 FHEVM（简化版：@zama-fhe/relayer-sdk 不需要实例初始化）
+  const initializeFHEVM = async () => {
     try {
-      console.log('🔄 开始初始化 FHEVM...', { contractAddress, userAddress });
+      console.log('🔄 检查 Gateway 状态...');
       
       // 检查 Gateway 状态
       const isUp = await checkGatewayHealth();
       setGatewayStatus(isUp ? 'up' : 'down');
 
       if (isUp) {
-        console.log('🔐 创建 FHEVM 实例...');
-        
-        try {
-          // 获取 Gateway 公钥
-          const publicKeyResponse = await fetch(`${GATEWAY_URL}/public_key`);
-          const publicKey = await publicKeyResponse.text();
-          
-          if (!publicKey.startsWith('0x04')) {
-            throw new Error('Invalid public key format');
-          }
-          
-          // 创建 FHEVM 实例
-          const instance = await createInstance({
-            chainId: SEPOLIA_CHAIN_ID,
-            publicKey: publicKey
-          });
-          
-          setFhevmInstance(instance);
-          setIsInitialized(true);
-          console.log('✅ FHEVM 实例创建成功');
-        } catch (error: any) {
-          console.error('❌ FHEVM 实例创建失败:', error);
-          setFhevmInstance(null);
-          setIsInitialized(false);
-          setGatewayStatus('down');
-        }
+        // ✅ @zama-fhe/relayer-sdk 不需要创建实例
+        // createEncryptedInput 是直接导入的函数，可以直接使用
+        setIsInitialized(true);
+        console.log('✅ Gateway 在线，可以使用 FHE 加密');
       } else {
         console.log('⚠️ Gateway 离线，将使用 Mock 模式');
-        setFhevmInstance(null);
         setIsInitialized(false);
       }
     } catch (error) {
-      console.error('❌ FHEVM 初始化失败:', error);
+      console.error('❌ Gateway 状态检查失败:', error);
       setGatewayStatus('down');
-      setFhevmInstance(null);
       setIsInitialized(false);
     }
   };
 
-  // 加密年龄
+  // 加密年龄（使用手册推荐的 @zama-fhe/relayer-sdk）
   const encryptAge = async (
     age: number,
     contractAddress: string,
     userAddress: string
   ): Promise<{ encrypted: any; proof: string } | null> => {
     try {
-      // 如果没有实例，先初始化
-      if (!fhevmInstance) {
-        await initializeFHEVM(contractAddress, userAddress);
-        // 等待一下让实例设置完成
-        await new Promise(resolve => setTimeout(resolve, 500));
+      console.log('🔐 加密年龄:', age, {
+        contractAddress,
+        userAddress
+      });
+
+      // ✅ 使用手册推荐的 API（手册 3.5.2节）
+      // 步骤 1: 创建加密上下文
+      const input = createEncryptedInput(
+        contractAddress,  // 合约地址
+        userAddress       // 签名者地址
+      );
+
+      // 步骤 2: 添加数据（32位无符号整数，年龄使用32位足够）
+      input.add32(BigInt(age));
+
+      // 步骤 3: 加密并生成证明
+      const { handles, inputProof } = await input.encrypt();
+
+      // 步骤 4: 验证结果
+      if (!handles || handles.length === 0) {
+        throw new Error('加密失败: handles 为空');
       }
 
-      if (!fhevmInstance) {
-        console.warn('⚠️ FHEVM 实例不可用，无法加密');
-        return null;
+      if (!inputProof) {
+        throw new Error('加密失败: inputProof 为空');
       }
-
-      console.log('🔐 加密年龄:', age);
-
-      // 使用 FHEVM SDK 加密
-      // 根据 @fhevm/sdk 的 API，使用 generateEncryptedInput
-      // 注意：@fhevm/sdk 的 API 可能因版本而异，这里使用常见的模式
-      let encryptedInput;
-      
-      // 尝试不同的 API 调用方式
-      if (typeof fhevmInstance.generateEncryptedInput === 'function') {
-        encryptedInput = fhevmInstance.generateEncryptedInput(contractAddress, userAddress);
-      } else if (typeof fhevmInstance.createEncryptedInput === 'function') {
-        encryptedInput = fhevmInstance.createEncryptedInput(contractAddress, userAddress);
-      } else {
-        throw new Error('FHEVM instance does not support encryption API');
-      }
-
-      // 加密年龄值（32位）
-      encryptedInput.add32(age);
-      const encrypted = encryptedInput.encrypt();
 
       console.log('✅ 年龄加密成功');
 
       return {
-        encrypted: encrypted.handles[0], // externalEuint32 handle
-        proof: encrypted.inputProof // 加密证明
+        encrypted: handles[0],  // einput（加密句柄）
+        proof: inputProof        // bytes（证明/attestation）
       };
     } catch (error: any) {
       console.error('❌ 加密失败:', error);
@@ -156,26 +129,16 @@ export function FHEVMProvider({ children }: { children: ReactNode }) {
 
   // 定时轮询 Gateway 状态（60秒）
   useEffect(() => {
-    // 只检查健康状态，不初始化实例（实例需要合约地址和用户地址）
-    const checkStatus = async () => {
-      const isUp = await checkGatewayHealth();
-      setGatewayStatus(isUp ? 'up' : 'down');
-      
-      if (!isUp && fhevmInstance) {
-        // Gateway 离线，清除实例
-        setFhevmInstance(null);
-        setIsInitialized(false);
-      }
-    };
-
-    // 立即检查
-    checkStatus();
+    // 立即初始化
+    initializeFHEVM();
 
     // 定时检查
-    const interval = setInterval(checkStatus, 60000); // 60秒
+    const interval = setInterval(() => {
+      initializeFHEVM();
+    }, 60000); // 60秒
 
     return () => clearInterval(interval);
-  }, [fhevmInstance]);
+  }, []);
 
   const value: FHEVMContextType = {
     fhevmInstance,

@@ -12,6 +12,7 @@
   "dependencies": {
     "@fhevm/sdk": "^0.7.0-20",
     "@privy-io/react-auth": "^3.3.0",
+    "@zama-fhe/relayer-sdk": "^0.2.0",
     "buffer": "^6.0.3",
     "ethers": "^6.15.0",
     "react": "^19.1.1",
