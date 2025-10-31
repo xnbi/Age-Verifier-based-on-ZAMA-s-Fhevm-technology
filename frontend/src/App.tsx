@@ -2,6 +2,20 @@ import { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 import AgeVerifierABI from './AgeVerifier.json';
 import { FHEVMProvider, useFHEVM } from './contexts/FHEVMContext';
+import { useDecryption } from './hooks/useDecryption';
+import {
+  safeContractCall,
+  sendTransactionOKXCompatible,
+  waitForTransactionWithPublicRpc,
+  createReadWriteContracts,
+  detectWalletType
+} from './utils/walletCompatibility';
+import {
+  retryWithBackoff,
+  checkAndRetryDecryption,
+  withTimeout,
+  waitForCondition
+} from './utils/retryMechanism';
 
 const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS || '0x';
 const NFT_CONTRACT_ADDRESS = import.meta.env.VITE_NFT_CONTRACT_ADDRESS || '0x';
@@ -15,7 +29,7 @@ const NFT_ABI = [
 ];
 
 function AppContent() {
-  const { fheStatus } = useFHEVM();
+  const { fheStatus, encryptAge } = useFHEVM();
   
   const [account, setAccount] = useState<string>('');
   const [age, setAge] = useState('');
@@ -29,6 +43,27 @@ function AppContent() {
   const [nftTokenId, setNFTTokenId] = useState<number>(0);
   const [nftImageUrl, setNFTImageUrl] = useState('');
   const [loadingNFT, setLoadingNFT] = useState(false);
+
+  // Contract instance
+  const [contract, setContract] = useState<ethers.Contract | null>(null);
+
+  // 解密 Hook（当 Gateway 在线时使用）
+  const {
+    requestDecryption,
+    status: decryptionStatus,
+    progress: decryptionProgress,
+    error: decryptionError,
+    result: decryptionResult
+  } = useDecryption(contract);
+
+  // 初始化合约实例
+  useEffect(() => {
+    if (account && window.ethereum && CONTRACT_ADDRESS && CONTRACT_ADDRESS !== '0x') {
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const contractInstance = new ethers.Contract(CONTRACT_ADDRESS, AgeVerifierABI, provider);
+      setContract(contractInstance);
+    }
+  }, [account]);
 
   // Connect MetaMask
   const connectWallet = async () => {
@@ -81,25 +116,39 @@ function AppContent() {
     return ipfsUrl;
   };
 
-  // Check NFT Status
+  // Check NFT Status（使用公共 RPC 读取）
   const checkNFTStatus = async (address: string) => {
     if (!NFT_CONTRACT_ADDRESS || NFT_CONTRACT_ADDRESS === '0x') return;
     
     setLoadingNFT(true);
     try {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const nftContract = new ethers.Contract(NFT_CONTRACT_ADDRESS, NFT_ABI, provider);
-      
-      const hasCredential = await nftContract.hasCredential(address);
+      // ✅ 使用公共 RPC 读取（手册 6.4节）
+      const hasCredential = await safeContractCall(
+        NFT_CONTRACT_ADDRESS,
+        NFT_ABI,
+        'hasCredential',
+        [address]
+      );
       setHasNFT(hasCredential);
       
       if (hasCredential) {
-        const tokenId = await nftContract.getTokenIdOf(address);
+        // ✅ 使用公共 RPC 读取
+        const tokenId = await safeContractCall(
+          NFT_CONTRACT_ADDRESS,
+          NFT_ABI,
+          'getTokenIdOf',
+          [address]
+        );
         setNFTTokenId(Number(tokenId));
         
         // Get NFT metadata
         try {
-          const tokenURI = await nftContract.tokenURI(tokenId);
+          const tokenURI = await safeContractCall(
+            NFT_CONTRACT_ADDRESS,
+            NFT_ABI,
+            'tokenURI',
+            [tokenId]
+          );
           if (tokenURI.startsWith('data:application/json;base64,')) {
             const base64Data = tokenURI.split(',')[1];
             const jsonData = atob(base64Data);
@@ -151,9 +200,13 @@ function AppContent() {
         return;
       }
       try {
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        const contract = new ethers.Contract(CONTRACT_ADDRESS, AgeVerifierABI, provider);
-        const result = await contract.isVerified(account);
+        // ✅ 使用公共 RPC 读取（手册 6.4节）
+        const result = await safeContractCall(
+          CONTRACT_ADDRESS,
+          AgeVerifierABI,
+          'isVerified',
+          [account]
+        );
         setIsVerified(result);
         if (result) {
           setStatus('✅ Verified! You are eligible.');
@@ -171,7 +224,175 @@ function AppContent() {
     }
   }, [fheStatus, account]);
 
-  // Mock Verification
+  // FHE Verification (真正的加密验证)
+  const handleVerifyFHE = async () => {
+    if (!account) {
+      setStatus('❌ Please connect wallet first');
+      return;
+    }
+    if (!age) {
+      setStatus('❌ Please enter your age');
+      return;
+    }
+    if (!contract) {
+      setStatus('❌ Contract not initialized');
+      return;
+    }
+    if (!CONTRACT_ADDRESS || CONTRACT_ADDRESS === '0x') {
+      setStatus('❌ Contract address not configured');
+      return;
+    }
+
+    setLoading(true);
+    setStatus('⏳ Encrypting age...');
+
+    try {
+      const ageNum = Number(age);
+      if (isNaN(ageNum) || ageNum < 0 || ageNum > 120) {
+        throw new Error('Invalid age');
+      }
+
+      // 使用 FHEVM SDK 加密年龄
+      setStatus('🔐 Encrypting age with FHE...');
+      const encryptedData = await encryptAge(ageNum, CONTRACT_ADDRESS, account);
+
+      if (!encryptedData) {
+        throw new Error('Failed to encrypt age. Gateway may be offline.');
+      }
+
+      // 发送加密数据到合约（OKX 兼容方式）
+      setStatus('📤 Sending encrypted age to contract...');
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const contractInterface = new ethers.Interface(AgeVerifierABI);
+
+      // ✅ 使用 OKX 兼容的交易发送方式（手册 6.2节）
+      const walletType = detectWalletType();
+      let txHash: string;
+
+      if (walletType === 'okx' || walletType === 'other') {
+        // OKX 或其他钱包：使用低层 API
+        txHash = await sendTransactionOKXCompatible(
+          CONTRACT_ADDRESS,
+          contractInterface,
+          'verifyAge',
+          [encryptedData.encrypted, encryptedData.proof],
+          signer
+        );
+      } else {
+        // MetaMask：使用常规方式
+        const contractWithSigner = new ethers.Contract(CONTRACT_ADDRESS, AgeVerifierABI, signer);
+        const tx = await contractWithSigner.verifyAge(
+          encryptedData.encrypted,
+          encryptedData.proof
+        );
+        txHash = tx.hash;
+      }
+
+      setStatus('⏳ Waiting for transaction confirmation...');
+      
+      // ✅ 使用公共 RPC 轮询交易确认（手册 6.3节）
+      const receipt = await waitForTransactionWithPublicRpc(txHash);
+      console.log('Transaction receipt:', receipt);
+
+      // 从事件中获取 requestId
+      const contractInterface = new ethers.Interface(AgeVerifierABI);
+      const event = receipt.logs.find((log: any) => {
+        try {
+          const parsed = contractInterface.parseLog(log);
+          return parsed && parsed.name === 'DecryptionRequested';
+        } catch {
+          return false;
+        }
+      });
+
+      if (event) {
+        const parsedEvent = contractInterface.parseLog({
+          topics: event.topics || [],
+          data: event.data || '0x'
+        });
+        const requestId = parsedEvent?.args[0];
+        console.log('🔑 Decryption Request ID:', requestId.toString());
+
+        setStatus('⏳ Waiting for Gateway decryption...');
+        
+        // ✅ 等待解密完成（带重试机制和超时处理）
+        try {
+          await withTimeout(
+            waitForCondition(
+              async () => {
+                // 检查验证状态
+                const isVerified = await safeContractCall(
+                  CONTRACT_ADDRESS,
+                  AgeVerifierABI,
+                  'isVerified',
+                  [account]
+                );
+                
+                if (isVerified !== undefined) {
+                  setIsVerified(isVerified);
+                  
+                  if (isVerified) {
+                    setStatus('✅ Verification successful! NFT credential minted!');
+                    checkNFTStatus(account);
+                  } else {
+                    setStatus('❌ Age verification failed (under 18)');
+                  }
+                  
+                  return true;
+                }
+                
+                return false;
+              },
+              {
+                timeout: 120000, // 2分钟
+                interval: 5000, // 5秒
+                onProgress: (attempt) => {
+                  setStatus(`⏳ Waiting for decryption... (${attempt * 5}s)`);
+                }
+              }
+            ),
+            120000, // 2分钟超时
+            'Gateway 解密超时，请稍后重试'
+          );
+        } catch (error: any) {
+          console.warn('等待解密超时，检查是否需要重试:', error);
+          
+          // ✅ 检查并尝试重试
+          if (contract) {
+            const newRequestId = await checkAndRetryDecryption(
+              contract,
+              account,
+              (newId) => {
+                setStatus(`🔄 已重试解密请求，新请求ID: ${newId.toString()}`);
+              }
+            );
+            
+            if (newRequestId) {
+              setStatus('🔄 解密重试已提交，请稍候...');
+            } else {
+              setStatus('⚠️ 解密超时。请稍后手动检查验证状态。');
+            }
+          }
+        }
+      } else {
+        setStatus('⚠️ Verification submitted. Waiting for decryption...');
+      }
+
+    } catch (error: any) {
+      console.error('FHE Verification failed:', error);
+      setStatus('❌ FHE Verification failed: ' + (error.message || 'Unknown error'));
+      
+      // 如果加密失败，建议用户使用 Mock 模式
+      if (error.message?.includes('encrypt') || error.message?.includes('Gateway')) {
+        setStatus('⚠️ FHE encryption failed. Please try Mock mode or check Gateway status.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Mock Verification (Gateway 离线时使用)
   const handleVerifyMock = async () => {
     if (!account) {
       setStatus('❌ Please connect wallet first');
@@ -188,15 +409,33 @@ function AppContent() {
     try {
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, AgeVerifierABI, signer);
+      const contractInterface = new ethers.Interface(AgeVerifierABI);
 
       const ageNum = Number(age);
       setStatus('📤 Sending transaction...');
       
-      const tx = await contract.verifyAgeMock(ageNum);
+      // ✅ 使用 OKX 兼容方式发送交易
+      const walletType = detectWalletType();
+      let txHash: string;
+
+      if (walletType === 'okx' || walletType === 'other') {
+        txHash = await sendTransactionOKXCompatible(
+          CONTRACT_ADDRESS,
+          contractInterface,
+          'verifyAgeMock',
+          [ageNum],
+          signer
+        );
+      } else {
+        const contractInstance = new ethers.Contract(CONTRACT_ADDRESS, AgeVerifierABI, signer);
+        const tx = await contractInstance.verifyAgeMock(ageNum);
+        txHash = tx.hash;
+      }
+
       setStatus('⏳ Waiting for confirmation...');
       
-      const receipt = await tx.wait();
+      // ✅ 使用公共 RPC 轮询交易确认
+      const receipt = await waitForTransactionWithPublicRpc(txHash);
       console.log('Transaction receipt:', receipt);
       
       const result = ageNum >= 18;
@@ -217,6 +456,17 @@ function AppContent() {
       setStatus('❌ Verification failed: ' + (error.message || 'Unknown error'));
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 统一的验证函数（根据 Gateway 状态选择模式）
+  const handleVerify = async () => {
+    if (fheStatus === 'up' && contract) {
+      // Gateway 在线，使用 FHE 模式
+      await handleVerifyFHE();
+    } else {
+      // Gateway 离线，使用 Mock 模式
+      await handleVerifyMock();
     }
   };
 
@@ -285,16 +535,40 @@ function AppContent() {
 
                 {/* Verify Button */}
                 <button
-                  onClick={handleVerifyMock}
+                  onClick={handleVerify}
                   disabled={loading || !age}
                   className={`w-full py-4 rounded-xl font-semibold shadow-lg transition-all duration-200 transform ${
                     loading || !age
                       ? 'bg-gray-600 cursor-not-allowed'
-                      : 'bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 hover:scale-[1.02]'
+                      : fheStatus === 'up'
+                        ? 'bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 hover:scale-[1.02]'
+                        : 'bg-gradient-to-r from-yellow-600 to-orange-600 hover:from-yellow-700 hover:to-orange-700 hover:scale-[1.02]'
                   }`}
                 >
-                  {loading ? '🔄 Processing...' : '🎫 Verify Age & Mint NFT'}
+                  {loading ? '🔄 Processing...' : 
+                   fheStatus === 'up' ? '🔐 Verify Age (FHE Mode)' : 
+                   '🎫 Verify Age (Mock Mode)'}
                 </button>
+
+                {/* Decryption Progress (当使用 FHE 模式时) */}
+                {decryptionStatus === 'polling' && (
+                  <div className="bg-blue-900/20 border border-blue-700 rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-sm text-blue-400">解密进度</span>
+                      <span className="text-sm text-blue-300">{decryptionProgress}%</span>
+                    </div>
+                    <div className="w-full bg-gray-700 rounded-full h-2">
+                      <div 
+                        className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                        style={{ width: `${decryptionProgress}%` }}
+                      />
+                    </div>
+                    <p className="text-xs text-gray-400 mt-2 text-center">
+                      {decryptionStatus === 'polling' && '⏳ 正在轮询 Gateway 解密...'}
+                      {decryptionStatus === 'waiting' && '⏳ 等待链上回调完成...'}
+                    </p>
+                  </div>
+                )}
 
                 {/* Status Display */}
                 {status && (

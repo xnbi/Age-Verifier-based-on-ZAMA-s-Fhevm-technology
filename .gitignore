@@ -50,3 +50,18 @@ typechain-types/
 *.tsbuildinfo
 .temp/
 
+# 临时文档和报告（不上传到 GitHub）
+✅*.md
+🎉*.md
+🚀*.md
+P0*.md
+项目自查报告.md
+修复完成总结.md
+*.md
+!README.md
+!LICENSE
+!DEPLOYMENT.md
+!QUICK-START.md
+frontend/README.md
+contracts/README.md
+
